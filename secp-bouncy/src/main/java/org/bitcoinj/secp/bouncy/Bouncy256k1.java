@@ -26,6 +26,7 @@ import org.bitcoinj.secp.Secp256k1;
 import org.bitcoinj.secp.EcdsaSignature;
 import org.bitcoinj.secp.internal.EcdhSharedSecretImpl;
 import org.bitcoinj.secp.internal.SecpKeyPairImpl;
+import org.bitcoinj.secp.internal.SecpXOnlyPubKeyImpl;
 import org.bitcoinj.secp.internal.SecpScalarImpl;
 import org.bouncycastle.asn1.x9.X9ECParameters;
 import org.bouncycastle.crypto.AsymmetricCipherKeyPair;
@@ -43,6 +44,7 @@ import org.bouncycastle.math.ec.FixedPointCombMultiplier;
 import org.bouncycastle.math.ec.FixedPointUtil;
 
 import java.math.BigInteger;
+import java.nio.ByteBuffer;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
@@ -155,7 +157,22 @@ public class Bouncy256k1 implements Secp256k1 {
 
     @Override
     public SecpResult<SecpXOnlyPubKey> xOnlyPubKeyParse(byte[] inputData) {
-        throw new UnsupportedOperationException();
+        try {
+            // Bouncy castle needs 33 byte pubkey, so we prepend even parity
+            byte[] serialized = prependByte(inputData, (byte) 0x2);
+            BC_CURVE.getCurve().decodePoint(serialized);
+        } catch (IllegalArgumentException e) {
+            // If `decodePoint` fails, pubkey is invalid
+            return SecpResult.err(0);
+        }
+        return SecpResult.ok(SecpXOnlyPubKeyImpl.ofVerifiedBytes(inputData));
+    }
+
+    private byte[] prependByte(byte[] inputArray, byte toPrepend) {
+        return ByteBuffer.allocate(inputArray.length + 1)
+                .put(toPrepend)
+                .put(inputArray)
+                .array();
     }
 
     @Override

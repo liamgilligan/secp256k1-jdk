@@ -21,6 +21,7 @@ import org.bitcoinj.secp.SchnorrSignature;
 import org.bitcoinj.secp.SecpPrivKey;
 import org.bitcoinj.secp.SecpResult;
 import org.bitcoinj.secp.SecpXOnlyPubKey;
+import org.bitcoinj.secp.bouncy.Bouncy256k1;
 import org.bitcoinj.secp.ffm.Secp256k1Foreign;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -112,6 +113,20 @@ public class BIP340TestVectorTests {
         SecpResult<SecpXOnlyPubKey> result = secp.xOnlyPubKeyParse(vec.pubKey);
 
         assertEquals(0, result.errorCode());
+    }
+
+    /// For each vector in the subset containing invalid public keys, verify that
+    /// the `secp` instance will return an error when parsing the invalid public
+    /// key given in the [TestVector] argument.
+    /// @param vec TestVector to be tested.
+    @ParameterizedTest
+    @FieldSource("INVALIDPUBKEY_VECTORS")
+    void bcPubKeyParseFromInvalidBytes(TestVector vec) {
+        try (var secp = new Bouncy256k1()) {
+            SecpResult<SecpXOnlyPubKey> result = secp.xOnlyPubKeyParse(vec.pubKey);
+
+            assertEquals(0, result.errorCode());
+        }
     }
 
     /// For each vector in the subset containing invalid signatures, verify that
