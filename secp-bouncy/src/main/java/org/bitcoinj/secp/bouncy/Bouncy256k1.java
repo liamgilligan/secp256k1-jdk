@@ -15,19 +15,8 @@
  */
 package org.bitcoinj.secp.bouncy;
 
-import org.bitcoinj.secp.EcdhSharedSecret;
-import org.bitcoinj.secp.SecpKeyPair;
-import org.bitcoinj.secp.SecpPubKey;
-import org.bitcoinj.secp.SecpPrivKey;
-import org.bitcoinj.secp.SecpResult;
-import org.bitcoinj.secp.SecpXOnlyPubKey;
-import org.bitcoinj.secp.SchnorrSignature;
-import org.bitcoinj.secp.Secp256k1;
-import org.bitcoinj.secp.EcdsaSignature;
-import org.bitcoinj.secp.internal.EcdhSharedSecretImpl;
-import org.bitcoinj.secp.internal.SecpKeyPairImpl;
-import org.bitcoinj.secp.internal.SecpXOnlyPubKeyImpl;
-import org.bitcoinj.secp.internal.SecpScalarImpl;
+import org.bitcoinj.secp.*;
+import org.bitcoinj.secp.internal.*;
 import org.bouncycastle.asn1.x9.X9ECParameters;
 import org.bouncycastle.crypto.AsymmetricCipherKeyPair;
 import org.bouncycastle.crypto.digests.SHA256Digest;
@@ -45,6 +34,7 @@ import org.bouncycastle.math.ec.FixedPointUtil;
 
 import java.math.BigInteger;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
@@ -67,6 +57,10 @@ public class Bouncy256k1 implements Secp256k1 {
     static final BigInteger HALF_CURVE_ORDER;
 
     private static final SecureRandom secureRandom;
+
+    private static final byte[] AUX_TAG_PREFIX = "BIP0340/aux".getBytes(StandardCharsets.UTF_8);
+    private static final byte[] NONCE_TAG_PREFIX = "BIP0340/nonce".getBytes(StandardCharsets.UTF_8);
+    private static final byte[] CHALLENGE_TAG_PREFIX = "BIP0340/challenge".getBytes(StandardCharsets.UTF_8);
 
     static {
         // Tell Bouncy Castle to precompute data that's needed during secp256k1 calculations.
@@ -130,6 +124,12 @@ public class Bouncy256k1 implements Secp256k1 {
         return BC.toP256K1PubKey(pub);
     }
 
+    public SecpPubKey ecPubKeyTweakMul(SecpPoint.Uncompressed pubKey, BigInteger scalarMultiplier) {
+        ECPoint pubKeyBC = BC_CURVE.getCurve().createPoint(pubKey.x().toBigInteger(), pubKey.y().toBigInteger());
+        ECPoint pub = new FixedPointCombMultiplier().multiply(pubKeyBC, scalarMultiplier).normalize();
+        return BC.toP256K1PubKey(pub);
+    }
+
     @Override
     public SecpPubKey ecPubKeyCombine(SecpPubKey key1, SecpPubKey key2) {
         ECPoint pubKey1BC = BC_CURVE.getCurve().createPoint(key1.getW().getAffineX(), key1.getW().getAffineY());
@@ -173,6 +173,14 @@ public class Bouncy256k1 implements Secp256k1 {
                 .put(toPrepend)
                 .put(inputArray)
                 .array();
+    }
+
+    private byte[] concatByteArrays(byte[]... arrays) {
+        int totalLength = 0;
+        for (byte[] array : arrays) totalLength += array.length;
+        ByteBuffer buf = ByteBuffer.allocate(totalLength);
+        for (byte[] array : arrays) buf.put(array);
+        return buf.array();
     }
 
     @Override
@@ -254,17 +262,113 @@ public class Bouncy256k1 implements Secp256k1 {
 
     @Override
     public byte[] taggedSha256(byte[] tag, byte[] message) {
-        return new byte[0];
+        SHA256Digest digest = new SHA256Digest();
+        byte[] tagHash = new byte[32];
+        byte[] result = new byte[32];
+
+        digest.update(tag, 0, tag.length);
+        digest.doFinal(tagHash, 0);
+
+        digest.reset();
+        digest.update(tagHash, 0, 32);
+        digest.update(tagHash, 0, 32);
+        digest.update(message, 0, message.length);
+        digest.doFinal(result, 0);
+
+        return result;
     }
 
     @Override
     public SchnorrSignature schnorrSigSign32(byte[] msg_hash, SecpPrivKey privKey) {
-        throw new UnsupportedOperationException();
+        checkArg(msg_hash.length == 32, "Message must be 32-byte (hash)");
+        byte[] auxiliaryRandom = fillRandom(32);
+        return schnorrSigSign32(msg_hash, privKey, auxiliaryRandom);
+    }
+
+    public SchnorrSignature schnorrSigSign32(byte[] msg_hash, SecpPrivKey privKey, byte[] auxiliaryRandom) {
+        // d' = int(sk) = privKey
+        BigInteger privKeyS = privKey.getS();
+        // P = d' * G
+        SecpPubKey pubKey = ecPubKeyCreate(privKey);
+        byte[] pubKeyBytes = SecpScalarImpl.integerTo32Bytes(pubKey.xOnly().getX()); // for use in certain functions
+
+        // d = d' if has_even_y(P), otherwise d = n - d'
+        BigInteger adjustedPrivKey = pubKey.point().y().isOdd() ?
+                Secp256k1.N.subtract(privKeyS) :
+                privKeyS;
+        // t = xor(d, hash_{BIP0340/aux}(a))
+        byte[] maskedPrivKey = UInt256.integerTo32Bytes(adjustedPrivKey.xor(
+                        new BigInteger(1, taggedSha256(AUX_TAG_PREFIX, auxiliaryRandom))
+                ));
+
+        // rand = hash_{BIP0340/nonce}(t || bytes(P) || m)
+        byte[] rand = taggedSha256(NONCE_TAG_PREFIX, concatByteArrays(maskedPrivKey, pubKeyBytes, msg_hash));
+
+        // k' = int(rand) mod n
+        BigInteger privNonce = new BigInteger(1, rand).mod(Secp256k1.N);
+
+        // R = k' * G
+        SecpPubKey pubNonce = ecPubKeyCreate(new SecpPrivKeyImpl(privNonce));
+        byte[] pubNonceBytes = SecpScalarImpl.integerTo32Bytes(pubNonce.xOnly().getX());
+
+        // k = k' if has_even_y(R), otherwise let k = n - k'
+        BigInteger adjustedPrivNonce = pubNonce.point().y().isOdd() ?
+                negateScalar(privNonce) :
+                privNonce;
+
+        // e = int(hash_{BIP0340/challenge}(bytes(R) || bytes(P) || m)) mod n
+        byte[] challengeInput = concatByteArrays(pubNonceBytes, pubKeyBytes, msg_hash);
+        BigInteger challengeScalar = new BigInteger(1,
+                taggedSha256(CHALLENGE_TAG_PREFIX, challengeInput)).mod(Secp256k1.N
+        );
+
+        // sig = bytes(R) || bytes((k + ed) mod n).
+        byte[] sigBytes = concatByteArrays(
+                pubNonceBytes, SecpScalarImpl.integerTo32Bytes(
+                        adjustedPrivNonce.add(challengeScalar.multiply(adjustedPrivKey)).mod(Secp256k1.N)
+                )
+        );
+
+        SchnorrSignature sig = new SchnorrSignatureImpl(sigBytes);
+
+        boolean ret = privNonce.equals(BigInteger.ZERO) && schnorrSigVerify(sig, msg_hash, pubKey.xOnly()).get();
+
+        return sig;
+    }
+
+    private BigInteger negateScalar(BigInteger s) {
+        return Secp256k1.N.subtract(s);
     }
 
     @Override
     public SecpResult<Boolean> schnorrSigVerify(SchnorrSignature signature, byte[] msg_hash, SecpXOnlyPubKey pubKey) {
-        return SecpResult.err(-1);
+        BigInteger P = pubKey.getX();
+        BigInteger r = signature.r().toBigInteger();
+        BigInteger s = signature.s().toBigInteger();
+
+        byte[] rBytes = UInt256.integerTo32Bytes(r);
+        byte[] PBytes = UInt256.integerTo32Bytes(P);
+
+        byte[] challengeInput = concatByteArrays(rBytes, PBytes, msg_hash);
+        BigInteger e = new BigInteger(1,
+                taggedSha256(CHALLENGE_TAG_PREFIX, challengeInput)).mod(Secp256k1.N);
+
+
+        SecpPubKey PasPubKey = new SecpPubKeyImpl(
+                BC.toECPoint(BC_CURVE.getCurve().decodePoint(prependByte(PBytes, (byte) 0x2)))
+        );
+
+        SecpPubKey eP = ecPubKeyTweakMul(PasPubKey, e.negate());
+        SecpPubKey sG = ecPubKeyTweakMul(G, s);
+        SecpPubKey R;
+
+        try {
+            R = ecPubKeyCombine(sG, eP);
+        } catch (IllegalArgumentException ex) {
+            return SecpResult.ok(false);
+        }
+
+        return SecpResult.ok(R.xOnly().getX().equals(r) && !R.point().y().isOdd());
     }
 
     @Override
@@ -294,5 +398,22 @@ public class Bouncy256k1 implements Secp256k1 {
     @Override
     public String toString() {
         return "Secp256k1/" + ProviderId.BOUNCY_CASTLE;
+    }
+
+    private static void checkArg(boolean condition, String string) {
+        if (!condition) {
+            throw new IllegalArgumentException(string);
+        }
+    }
+
+    /**
+     *
+     * @param size size in bytes of random data
+     * @return A newly-allocated memory segment full of random data
+     */
+    private static byte[] fillRandom(int size) {
+        byte[] data = new byte[size];
+        secureRandom.nextBytes(data);
+        return data;
     }
 }

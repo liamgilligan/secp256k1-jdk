@@ -17,10 +17,7 @@ package org.bitcoinj.secp.integration;
 
 import com.opencsv.CSVReaderBuilder;
 import com.opencsv.exceptions.CsvException;
-import org.bitcoinj.secp.SchnorrSignature;
-import org.bitcoinj.secp.SecpPrivKey;
-import org.bitcoinj.secp.SecpResult;
-import org.bitcoinj.secp.SecpXOnlyPubKey;
+import org.bitcoinj.secp.*;
 import org.bitcoinj.secp.bouncy.Bouncy256k1;
 import org.bitcoinj.secp.ffm.Secp256k1Foreign;
 
@@ -56,7 +53,7 @@ public class BIP340TestVectorTests {
     /// @param comment note on specific vector
     private record TestVector(int index, byte[] privKey, byte[] pubKey, byte[] auxRand, byte[] message, byte[] signature, boolean verificationResult, String comment){ }
 
-    static final Secp256k1Foreign secp = new Secp256k1Foreign();
+    final Secp256k1Foreign secp = new Secp256k1Foreign();
 
     static final List<TestVector> ALL_VECTORS = parseCSV();
 
@@ -74,6 +71,22 @@ public class BIP340TestVectorTests {
         assertArrayEquals(vec.signature, actualSignature.bytes());
     }
 
+    /// For each vector in the subset containing valid signatures on 32-byte messages,
+    /// verify that the `secp` instance generates the exact, byte-for-byte signature
+    /// in the [TestVector] argument.
+    /// @param vec TestVector to be tested.
+    @ParameterizedTest
+    @FieldSource("SIGN32_VECTORS")
+    void bcSchnorrSigSign32(TestVector vec) {
+        try (Bouncy256k1 secp = new Bouncy256k1()) {
+            var privKey = SecpPrivKey.of(vec.privKey);
+
+            var actualSignature = secp.schnorrSigSign32(vec.message, privKey, vec.auxRand);
+
+            assertArrayEquals(vec.signature, actualSignature.bytes());
+        }
+    }
+
     /// For each vector in the subset containing valid public keys and valid signatures,
     /// verify that the `secp` instance signature verification result matches the
     /// expected verification result given by the [TestVector] argument.
@@ -88,6 +101,24 @@ public class BIP340TestVectorTests {
 
         assertEquals(vec.verificationResult, actualResult);
     }
+
+    /// For each vector in the subset containing valid public keys and valid signatures,
+    /// verify that the `secp` instance signature verification result matches the
+    /// expected verification result given by the [TestVector] argument.
+    /// @param vec TestVector to be tested.
+    @ParameterizedTest
+    @FieldSource("SIGNVERIFY_VECTORS")
+    void bcSchnorrSigVerify(TestVector vec) {
+        try (Bouncy256k1 secp = new Bouncy256k1()) {
+            var pubKey = secp.xOnlyPubKeyParse(vec.pubKey).get();
+            var signature = SchnorrSignature.of(vec.signature);
+
+            boolean actualResult = secp.schnorrSigVerify(signature, vec.message, pubKey).get();
+
+            assertEquals(vec.verificationResult, actualResult);
+        }
+    }
+
 
     /// For each vector in the subset containing private keys, verify that the `secp`
     /// instance generates the exact, byte-for-byte public key in the [TestVector]
